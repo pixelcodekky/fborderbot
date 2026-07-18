@@ -1,0 +1,30 @@
+# ---- Build stage ----
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+
+# Install git in case of private/go-gettable deps
+RUN apk add --no-cache git
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o server .
+
+# ---- Run stage ----
+FROM alpine:latest
+
+# certs needed for HTTPS calls (e.g. to Azure Function, Postgres SSL)
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /root/
+
+COPY --from=builder /app/server .
+
+# Render provides PORT env var — make sure your app reads it
+EXPOSE 8080
+
+CMD ["./server"]
