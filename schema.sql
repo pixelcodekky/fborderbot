@@ -39,12 +39,16 @@ CREATE TABLE orders (
         -- pending_form -> pending_payment -> paid -> fulfilled | payment_failed | cancelled
     stripe_checkout_session_id  TEXT,
     stripe_payment_intent_id    TEXT,
+    last_error                  TEXT,                -- most recent failure, cleared on success
+    last_error_step             TEXT,                -- e.g. 'private_reply', 'confirmation_email'
+    last_error_at               TIMESTAMPTZ,
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_orders_page_status ON orders(page_id, status);
 CREATE UNIQUE INDEX idx_orders_comment ON orders(fb_comment_id);
+CREATE INDEX idx_orders_failed ON orders(last_error_at) WHERE last_error IS NOT NULL;
 
 -- Dedupe table for inbound webhooks (Meta and Stripe both redeliver).
 CREATE TABLE webhook_events (

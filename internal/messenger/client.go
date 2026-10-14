@@ -3,9 +3,12 @@ package messenger
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"time"
 )
 
 const graphBaseURL = "https://graph.facebook.com/v21.0"
@@ -16,7 +19,24 @@ type Client struct {
 }
 
 func New(pageAccessToken string) *Client {
-	return &Client{PageAccessToken: pageAccessToken, HTTPClient: http.DefaultClient}
+	return &Client{PageAccessToken: pageAccessToken, HTTPClient: &http.Client{Timeout: 15 * time.Second}}
+}
+
+// APIError is a non-2xx response from the Graph API.
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("messenger API error (%d): %s", e.StatusCode, e.Body)
+}
+
+// IsPermanent reports whether err is a Graph API rejection that will fail the
+// same way on retry, e.g. an expired token or a comment older than 7 days.
+func IsPermanent(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 && ae.StatusCode != http.StatusTooManyRequests
 }
 
 // SendPrivateReply sends the FIRST message to a user based on a comment they left.
@@ -98,8 +118,8 @@ func (c *Client) post(path string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	url := graphBaseURL + path + "?access_token=" + c.PageAccessToken
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	endpoint := graphBaseURL + path + "?access_token=" + c.PageAccessToken
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +127,11 @@ func (c *Client) post(path string, body any) ([]byte, error) {
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
+		// *url.Error embeds the full URL, access token included; keep it out of logs.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return nil, fmt.Errorf("messenger %s %s: %w", ue.Op, path, ue.Err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -116,7 +141,7 @@ func (c *Client) post(path string, body any) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("messenger API error (%d): %s", resp.StatusCode, respBody)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	return respBody, nil
 }

@@ -17,7 +17,32 @@ FB_WEBHOOK_VERIFY_TOKEN   any string you also set in the Meta App dashboard
 FB_APP_SECRET             from the Meta App dashboard (for X-Hub-Signature-256)
 STRIPE_SECRET_KEY         sk_live_... / sk_test_...
 STRIPE_WEBHOOK_SECRET     whsec_... (from the Stripe webhook endpoint config)
+LOG_LEVEL                 optional: debug | info (default) | warn | error
 ```
+The app exits at startup if any of the required ones are missing.
+
+## Debugging in production
+Logs are JSON on stdout, one line per event. Every line from a webhook carries
+`request_id` and, once known, `source`, `comment_id`, `page_id`, `order_id`,
+`psid`, `stripe_event_id` and `step`, so filtering on `order_id` shows an
+order's whole history.
+
+Failures are also recorded on the order itself:
+```sql
+SELECT id, status, last_error_step, last_error, last_error_at
+FROM orders WHERE last_error IS NOT NULL ORDER BY last_error_at DESC;
+```
+
+Retries: transient failures (DB errors, network errors, Graph API 5xx) release
+the webhook dedupe claim and return 500, so Meta/Stripe redeliver and the event
+is processed again. Permanent ones (unknown page, Graph API 4xx, bad metadata)
+are logged and ACKed.
+
+`/health` pings the database and returns 503 if it is unreachable.
+
+## Migrations
+`schema.sql` is the full schema for a new database. For an existing one, apply
+the files in `migrations/` in order.
 
 ## Not included (next pass)
 - The order-form webview (product selection → quantity/address) that the

@@ -30,3 +30,25 @@ func MarkEventSeen(ctx context.Context, pool *pgxpool.Pool, source, eventID stri
 	}
 	return tag.RowsAffected() > 0, nil
 }
+
+// ReleaseEvent undoes MarkEventSeen so the next redelivery of the event is
+// processed again. Call it when handling failed with a retryable error.
+func ReleaseEvent(ctx context.Context, pool *pgxpool.Pool, source, eventID string) error {
+	_, err := pool.Exec(ctx,
+		`DELETE FROM webhook_events WHERE source = $1 AND event_id = $2`,
+		source, eventID,
+	)
+	return err
+}
+
+// RecordOrderError stores the failing step and error on the order, so stuck
+// orders can be found with: SELECT * FROM orders WHERE last_error IS NOT NULL.
+func RecordOrderError(ctx context.Context, pool *pgxpool.Pool, orderID int64, step string, cause error) error {
+	_, err := pool.Exec(ctx,
+		`UPDATE orders
+		 SET last_error = $1, last_error_step = $2, last_error_at = now(), updated_at = now()
+		 WHERE id = $3`,
+		cause.Error(), step, orderID,
+	)
+	return err
+}
