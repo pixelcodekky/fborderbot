@@ -12,17 +12,49 @@ import (
 	"os"
 	"runtime/debug"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
 
-// Setup installs a JSON logger on stdout as the slog default. level is one of
-// debug|info|warn|error; anything else falls back to info.
-func Setup(level string) *slog.Logger {
+// Options configures Setup.
+type Options struct {
+	Level             string // debug|info|warn|error; anything else means info
+	SentryDSN         string // empty disables Sentry
+	SentryEnvironment string // e.g. production, staging
+	Release           string // e.g. the git commit being run
+}
+
+// Setup installs a JSON logger on stdout as the slog default. With a Sentry
+// DSN, ERROR-level records are also reported to Sentry.
+func Setup(o Options) *slog.Logger {
 	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+	if err := lvl.UnmarshalText([]byte(o.Level)); err != nil {
 		lvl = slog.LevelInfo
 	}
-	l := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+	var handler slog.Handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+
+	var sentryErr error
+	if o.SentryDSN != "" {
+		sentryErr = sentry.Init(sentry.ClientOptions{
+			Dsn:         o.SentryDSN,
+			Environment: o.SentryEnvironment,
+			Release:     o.Release,
+		})
+		if sentryErr == nil {
+			handler = newSentryHandler(handler)
+		}
+	}
+
+	l := slog.New(handler)
 	slog.SetDefault(l)
+	switch {
+	case sentryErr != nil:
+		l.Warn("sentry disabled: init failed; check SENTRY_DSN", "err", sentryErr)
+	case o.SentryDSN == "":
+		l.Info("sentry disabled: SENTRY_DSN not set")
+	default:
+		l.Info("sentry enabled", "environment", o.SentryEnvironment, "release", o.Release)
+	}
 	return l
 }
 

@@ -18,6 +18,8 @@ FB_APP_SECRET             from the Meta App dashboard (for X-Hub-Signature-256)
 STRIPE_SECRET_KEY         sk_live_... / sk_test_...
 STRIPE_WEBHOOK_SECRET     whsec_... (from the Stripe webhook endpoint config)
 LOG_LEVEL                 optional: debug | info (default) | warn | error
+SENTRY_DSN                optional: enables error alerts (see Alerting)
+SENTRY_ENVIRONMENT        optional: defaults to "production"
 ```
 The app exits at startup if any of the required ones are missing.
 
@@ -39,6 +41,32 @@ is processed again. Permanent ones (unknown page, Graph API 4xx, bad metadata)
 are logged and ACKed.
 
 `/health` pings the database and returns 503 if it is unreachable.
+
+## Alerting
+**Sentry (errors).** Create a Go project at sentry.io (free tier is enough) and
+set `SENTRY_DSN`. Every ERROR log line is then also sent to Sentry:
+- the issue title is `<message>: <error>`, e.g. `private_reply failed: messenger API error (400) ...`
+- issues are grouped by log message, so one failing step = one issue
+- `order_id`, `page_id`, `comment_id`, `stripe_event_id`, `source`, `step`
+  and `request_id` are tags you can search on; the `request_id` finds the full
+  log trail in Render
+- the same message is sent at most once a minute (logs still have every
+  occurrence), so an outage doesn't use up the quota
+
+In Sentry, add an alert rule "a new issue is created" → email/Slack. On Render,
+`RENDER_GIT_COMMIT` is sent as the release, so you can see which deploy
+introduced an issue. WARN lines (bad webhook signatures, unknown checkout
+sessions) are not sent: scanners hitting the webhook URLs would be noisy.
+
+**Uptime.** Point an external monitor (UptimeRobot, Better Stack) at
+`https://<your-app>/health` every 1–5 minutes with email/Slack alerts. Also set
+Render's health check path to `/health` so a dead DB connection restarts the
+service.
+
+**Provider dashboards.** Failed deliveries show up on the sender's side too:
+Stripe → Developers → Webhooks → your endpoint (per-event responses, resend
+button), and Meta App dashboard → Webhooks. Meta may disable a webhook
+subscription that keeps failing, so check there if comments stop arriving.
 
 ## Migrations
 `schema.sql` is the full schema for a new database. For an existing one, apply

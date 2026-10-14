@@ -29,8 +29,20 @@ var requiredEnv = []string{
 
 func main() {
 	godotenv.Load()
-	log := obs.Setup(os.Getenv("LOG_LEVEL"))
+	log := obs.Setup(obs.Options{
+		Level:             os.Getenv("LOG_LEVEL"),
+		SentryDSN:         os.Getenv("SENTRY_DSN"),
+		SentryEnvironment: envOr("SENTRY_ENVIRONMENT", "production"),
+		Release:           os.Getenv("RENDER_GIT_COMMIT"), // set by Render
+	})
+	defer obs.Flush()
 	ctx := context.Background()
+
+	fatal := func(msg string, args ...any) {
+		log.Error(msg, args...)
+		obs.Flush() // os.Exit skips deferred calls
+		os.Exit(1)
+	}
 
 	var missing []string
 	for _, k := range requiredEnv {
@@ -39,16 +51,14 @@ func main() {
 		}
 	}
 	if len(missing) > 0 {
-		log.Error("missing required env vars", "missing", missing)
-		os.Exit(1)
+		fatal("missing required env vars", "missing", missing)
 	}
 
 	stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
 
 	pool, err := db.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Error("db connect failed", "err", err)
-		os.Exit(1)
+		fatal("db connect failed", "err", err)
 	}
 	defer pool.Close()
 
@@ -77,9 +87,15 @@ func main() {
 	}
 	log.Info("listening", "port", port)
 	if err := http.ListenAndServe(":"+port, obs.Middleware(mux)); err != nil {
-		log.Error("server stopped", "err", err)
-		os.Exit(1)
+		fatal("server stopped", "err", err)
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func sendEmailStub(to, subject, body string) error {
