@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,6 +27,19 @@ type Handler struct {
 	AppSecret      string // used to validate X-Hub-Signature-256
 	TriggerKeyword string // e.g. "order"
 	NewMessenger   func(pageAccessToken string) *messenger.Client
+
+	Now func() time.Time // defaults to time.Now; overridden in tests
+}
+
+// privateReplyWindow is how long after a comment Meta still accepts a
+// private reply to it.
+const privateReplyWindow = 7 * 24 * time.Hour
+
+func (h *Handler) now() time.Time {
+	if h.Now != nil {
+		return h.Now()
+	}
+	return time.Now()
 }
 
 // ServeHTTP handles both the one-time GET verification handshake and the
@@ -43,6 +57,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+
 	if q.Get("hub.mode") == "subscribe" && q.Get("hub.verify_token") == h.VerifyToken {
 		obs.Logger(r.Context()).Info("facebook webhook verified")
 		w.Write([]byte(q.Get("hub.challenge")))
@@ -58,11 +73,16 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 	log := obs.Logger(ctx).With("source", "facebook")
 
 	rawBody, err := io.ReadAll(r.Body)
+
 	if err != nil {
 		log.Warn("read body failed", "err", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
+	// Debug only: bodies hold commenters' names and messages. Run with
+	// LOG_LEVEL=debug to see them.
+	log.Debug("webhook body", "body", string(rawBody))
 
 	if !h.validSignature(r.Header.Get("X-Hub-Signature-256"), rawBody) {
 		log.Warn("invalid webhook signature; check FB_APP_SECRET")
@@ -74,6 +94,11 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(rawBody, &payload); err != nil {
 		// Redelivering the same bytes won't fix it, so ACK and log.
 		log.Error("bad payload", "err", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if payload.Object != "page" {
+		log.Info("ignoring non-page webhook", "object", payload.Object)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -106,8 +131,8 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	if c.Verb != "add" {
 		return false // ignore edits/removes for order-triggering purposes
 	}
-	if !strings.Contains(strings.ToLower(c.Message), h.TriggerKeyword) {
-		return false
+	if c.From.ID == pageFBID {
+		return false // the Page's own replies must not trigger orders
 	}
 
 	log := obs.Logger(ctx).With(
@@ -115,7 +140,30 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 		"page_fb_id", pageFBID,
 		"comment_id", c.CommentID,
 		"post_id", c.PostID,
+		"from_id", c.From.ID,
 	)
+
+	// Meta leaves out "message" when the app can't read the commenter's
+	// content (missing pages_read_user_content, or a non-tester while the
+	// app is in development mode), and for sticker/photo-only comments.
+	if c.Message == "" {
+		log.Info("comment has no message text; skipped")
+		return false
+	}
+	if !strings.Contains(strings.ToLower(c.Message), strings.ToLower(h.TriggerKeyword)) {
+		log.Info("comment has no trigger keyword; skipped", "keyword", h.TriggerKeyword)
+		return false
+	}
+	if c.Post.ID != "" && !c.Post.IsPublished {
+		log.Info("comment on unpublished post; skipped")
+		return false
+	}
+	// A private reply is only allowed within 7 days of the comment, so a
+	// late redelivery would fail permanently anyway.
+	if age := h.now().Sub(time.Unix(c.CreatedTime, 0)); c.CreatedTime != 0 && age > privateReplyWindow {
+		log.Warn("comment too old for a private reply; skipped", "age", age.String())
+		return false
+	}
 
 	// Dedupe: Meta redelivers webhooks, and a Page can receive the same
 	// comment event more than once.
@@ -151,11 +199,13 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	// comment ID. On a retry the row already exists and we just get its id.
 	var orderID int64
 	err = h.Pool.QueryRow(ctx,
-		`INSERT INTO orders (page_id, fb_comment_id, status)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO orders (page_id, fb_comment_id, status,
+		                     commenter_fb_id, commenter_name, comment_message, post_permalink)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (fb_comment_id) DO UPDATE SET updated_at = now()
 		 RETURNING id`,
 		pageID, c.CommentID, "pending_form",
+		nullIfEmpty(c.From.ID), nullIfEmpty(c.From.Name), nullIfEmpty(c.Message), nullIfEmpty(c.Post.PermalinkURL),
 	).Scan(&orderID)
 	if err != nil {
 		log.Error("create order failed", "step", "create_order", "err", err)
@@ -190,7 +240,7 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 		h.recordOrderError(ctx, log, orderID, "store_psid", err)
 		return false
 	}
-	log.Info("private reply sent")
+	log.Info("private reply sent", "permalink", c.Post.PermalinkURL)
 
 	// From here, a follow-up call (not shown) would send the product
 	// carousel to psid via client.SendProductCarousel(...).
@@ -202,6 +252,13 @@ func (h *Handler) recordOrderError(ctx context.Context, log *slog.Logger, orderI
 	if dbErr := db.RecordOrderError(ctx, h.Pool, orderID, step, err); dbErr != nil {
 		log.Error("record order error failed", "err", dbErr)
 	}
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func (h *Handler) lookupPage(ctx context.Context, fbPageID string) (pageID int64, accessToken string, err error) {
@@ -230,9 +287,11 @@ func (h *Handler) validSignature(header string, body []byte) bool {
 // --- payload shapes (trimmed to the fields we use) ---
 
 type webhookPayload struct {
-	Entry []struct {
-		ID      string         `json:"id"`
-		Changes []changeEntry  `json:"changes"`
+	Object string `json:"object"` // "page"
+	Entry  []struct {
+		ID      string        `json:"id"`   // Page ID
+		Time    int64         `json:"time"` // unix seconds
+		Changes []changeEntry `json:"changes"`
 	} `json:"entry"`
 }
 
@@ -242,9 +301,25 @@ type changeEntry struct {
 }
 
 type commentValue struct {
-	Item      string `json:"item"`
-	Verb      string `json:"verb"`
-	CommentID string `json:"comment_id"`
-	Message   string `json:"message"`
-	PostID    string `json:"post_id"`
+	Item        string `json:"item"`
+	Verb        string `json:"verb"`
+	CommentID   string `json:"comment_id"`
+	PostID      string `json:"post_id"`
+	ParentID    string `json:"parent_id"` // post ID for top-level comments, comment ID for replies
+	CreatedTime int64  `json:"created_time"`
+	Message     string `json:"message"` // may be absent, see processComment
+	From        struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"from"`
+	Post postInfo `json:"post"` // sent alongside comments; may be absent
+}
+
+type postInfo struct {
+	ID              string `json:"id"`
+	StatusType      string `json:"status_type"` // e.g. "mobile_status_update"
+	IsPublished     bool   `json:"is_published"`
+	UpdatedTime     string `json:"updated_time"` // e.g. "2026-10-20T01:31:46+0000"
+	PermalinkURL    string `json:"permalink_url"`
+	PromotionStatus string `json:"promotion_status"`
 }

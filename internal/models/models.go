@@ -7,6 +7,10 @@ type Order struct {
 	PageID                   int64
 	ProductID                *int64
 	FBCommentID              string
+	CommenterFBID            *string
+	CommenterName            *string
+	CommentMessage           *string
+	PostPermalink            *string
 	PSID                     *string
 	Quantity                 int
 	AmountCents              *int64
