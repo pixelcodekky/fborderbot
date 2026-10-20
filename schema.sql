@@ -29,6 +29,10 @@ CREATE TABLE orders (
     page_id                     BIGINT NOT NULL REFERENCES pages(id),
     product_id                  BIGINT REFERENCES products(id),
     fb_comment_id               TEXT NOT NULL,
+    commenter_fb_id             TEXT,                -- comment "from.id" (page-scoped, not the PSID)
+    commenter_name              TEXT,
+    comment_message             TEXT,                -- the comment that triggered the order
+    post_permalink              TEXT,
     psid                        TEXT,                -- filled in once the user replies in Messenger
     quantity                    INTEGER NOT NULL DEFAULT 1,
     amount_cents                INTEGER,
