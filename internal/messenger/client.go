@@ -16,6 +16,7 @@ const graphBaseURL = "https://graph.facebook.com/v21.0"
 type Client struct {
 	PageAccessToken string
 	HTTPClient      *http.Client
+	BaseURL         string // defaults to graphBaseURL; overridden in tests
 }
 
 func New(pageAccessToken string) *Client {
@@ -43,9 +44,19 @@ func IsPermanent(err error) bool {
 // Only usable once per comment_id, and only within 7 days of the comment. This is
 // what opens the Messenger thread — after this, you have a normal PSID to message.
 func (c *Client) SendPrivateReply(commentID, text string) (psid string, err error) {
+	return c.privateReply(commentID, map[string]string{"text": text})
+}
+
+// SendPrivateReplyButtons is SendPrivateReply with a Button Template: text
+// (max 640 chars) above 1-3 buttons.
+func (c *Client) SendPrivateReplyButtons(commentID, text string, buttons []Button) (psid string, err error) {
+	return c.privateReply(commentID, buttonTemplate(text, buttons))
+}
+
+func (c *Client) privateReply(commentID string, message any) (psid string, err error) {
 	body := map[string]any{
 		"recipient": map[string]string{"comment_id": commentID},
-		"message":   map[string]string{"text": text},
+		"message":   message,
 	}
 	resp, err := c.post("/me/messages", body)
 	if err != nil {
@@ -59,6 +70,38 @@ func (c *Client) SendPrivateReply(commentID, text string) (psid string, err erro
 		return "", err
 	}
 	return out.RecipientID, nil
+}
+
+// Button is one Messenger template button. A postback button sends Payload
+// back to the webhook when tapped; a web_url button opens URL.
+type Button struct {
+	Type    string `json:"type"`  // "postback" | "web_url"
+	Title   string `json:"title"` // max 20 chars
+	Payload string `json:"payload,omitempty"`
+	URL     string `json:"url,omitempty"`
+}
+
+// SendButtons sends a Button Template to an already-known PSID.
+func (c *Client) SendButtons(psid, text string, buttons []Button) error {
+	body := map[string]any{
+		"recipient": map[string]string{"id": psid},
+		"message":   buttonTemplate(text, buttons),
+	}
+	_, err := c.post("/me/messages", body)
+	return err
+}
+
+func buttonTemplate(text string, buttons []Button) map[string]any {
+	return map[string]any{
+		"attachment": map[string]any{
+			"type": "template",
+			"payload": map[string]any{
+				"template_type": "button",
+				"text":          text,
+				"buttons":       buttons,
+			},
+		},
+	}
 }
 
 // SendText sends a plain text message to an already-known PSID (used once we're
@@ -83,8 +126,8 @@ func (c *Client) SendProductCarousel(psid string, products []CarouselItem) error
 			"image_url": p.ImageURL,
 			"buttons": []map[string]string{
 				{
-					"type": "web_url",
-					"url":  p.OrderFormURL,
+					"type":  "web_url",
+					"url":   p.OrderFormURL,
 					"title": "Order this",
 				},
 			},
@@ -118,7 +161,11 @@ func (c *Client) post(path string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	endpoint := graphBaseURL + path + "?access_token=" + c.PageAccessToken
+	base := c.BaseURL
+	if base == "" {
+		base = graphBaseURL
+	}
+	endpoint := base + path + "?access_token=" + c.PageAccessToken
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

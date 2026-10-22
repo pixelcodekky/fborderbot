@@ -19,6 +19,7 @@ import (
 	"fb-order-bot/internal/db"
 	"fb-order-bot/internal/messenger"
 	"fb-order-bot/internal/obs"
+	"fb-order-bot/internal/payments"
 )
 
 type Handler struct {
@@ -28,7 +29,16 @@ type Handler struct {
 	TriggerKeyword string // e.g. "order"
 	NewMessenger   func(pageAccessToken string) *messenger.Client
 
+	// Payments makes the payment links for the 2C2P and PayNow buttons; see
+	// payments.Service. Nil disables both buttons' links.
+	Payments OrderPayments
+
 	Now func() time.Time // defaults to time.Now; overridden in tests
+}
+
+// OrderPayments is implemented by *payments.Service.
+type OrderPayments interface {
+	Pay(ctx context.Context, method string, req payments.PayRequest) (payments.PayResult, error)
 }
 
 // privateReplyWindow is how long after a comment Meta still accepts a
@@ -105,14 +115,32 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Process before ACKing: a non-200 makes Meta redeliver, which is how
 	// transient failures get retried. Already-handled comments in the batch
-	// are skipped on redelivery by the dedupe table.
+	// are skipped on redelivery by the dedupe table; post handling is an
+	// idempotent upsert.
 	retry := false
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
-			if change.Field != "feed" || change.Value.Item != "comment" {
+			if change.Field != "feed" {
 				continue
 			}
-			if h.processComment(ctx, entry.ID, change.Value) {
+			var failed bool
+			switch {
+			case change.Value.Item == "comment":
+				log.Info("Processing comment", "comment", change.Value)
+				failed = h.processComment(ctx, entry.ID, change.Value)
+			case postItems[change.Value.Item]:
+				log.Info("Processing post", "post", change.Value)
+				failed = h.processPost(ctx, entry.ID, change.Value)
+			}
+			if failed {
+				retry = true
+			}
+		}
+		for _, ev := range entry.Messaging {
+			if ev.Postback == nil {
+				continue // messages, reads, echoes: not handled
+			}
+			if h.processPostback(ctx, entry.ID, ev) {
 				retry = true
 			}
 		}
@@ -150,10 +178,6 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 		log.Info("comment has no message text; skipped")
 		return false
 	}
-	if !strings.Contains(strings.ToLower(c.Message), strings.ToLower(h.TriggerKeyword)) {
-		log.Info("comment has no trigger keyword; skipped", "keyword", h.TriggerKeyword)
-		return false
-	}
 	if c.Post.ID != "" && !c.Post.IsPublished {
 		log.Info("comment on unpublished post; skipped")
 		return false
@@ -163,6 +187,48 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	if age := h.now().Sub(time.Unix(c.CreatedTime, 0)); c.CreatedTime != 0 && age > privateReplyWindow {
 		log.Warn("comment too old for a private reply; skipped", "age", age.String())
 		return false
+	}
+
+	t, err := h.lookupTrigger(ctx, pageFBID, c.PostID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		log.Error("comment for unknown page; add it to the pages table", "step", "lookup_page")
+		return false
+	}
+	if err != nil {
+		log.Error("page lookup failed", "step", "lookup_page", "err", err)
+		return true
+	}
+	log = log.With("page_id", t.pageID)
+	if !t.postWatched {
+		// The permalink is logged so the post can be found and added.
+		log.Info("post is not a trigger post; skipped", "permalink", c.Post.PermalinkURL)
+		return false
+	}
+
+	keywords := make([]string, len(t.keywords))
+	for i, k := range t.keywords {
+		if k == "" {
+			k = h.TriggerKeyword // manual row without its own keyword
+		}
+		keywords[i] = k
+	}
+	matched := findKeywords(c.Message, keywords)
+	if len(matched) == 0 {
+		log.Info("comment has no trigger keyword; skipped", "keywords", keywords)
+		return false
+	}
+	log = log.With("keyword", matched[0])
+
+	// Without a linked product there is no price, so the reply falls back to
+	// plain text and the order has no amount.
+	prod, err := h.lookupProduct(ctx, t.pageID, matched)
+	if errors.Is(err, pgx.ErrNoRows) {
+		log.Warn("no active product linked to keyword; replying without payment buttons")
+	} else if err != nil {
+		log.Error("product lookup failed", "step", "lookup_product", "err", err)
+		return true
+	} else {
+		log = log.With("product_id", prod.productID)
 	}
 
 	// Dedupe: Meta redelivers webhooks, and a Page can receive the same
@@ -183,29 +249,25 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 		}
 	}
 
-	pageID, pageAccessToken, err := h.lookupPage(ctx, pageFBID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		log.Error("comment for unknown page; add it to the pages table", "step", "lookup_page")
-		return false
-	}
-	if err != nil {
-		log.Error("page lookup failed", "step", "lookup_page", "err", err)
-		release()
-		return true
-	}
-	log = log.With("page_id", pageID)
+	pageID, pageAccessToken := t.pageID, t.accessToken
 
 	// Create the order row immediately in pending_form status, keyed by the
 	// comment ID. On a retry the row already exists and we just get its id.
 	var orderID int64
+	var productID, amountCents *int64
+	if prod.productID != 0 {
+		productID, amountCents = &prod.productID, &prod.priceCents
+	}
 	err = h.Pool.QueryRow(ctx,
 		`INSERT INTO orders (page_id, fb_comment_id, status,
-		                     commenter_fb_id, commenter_name, comment_message, post_permalink)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		                     commenter_fb_id, commenter_name, comment_message, post_permalink,
+		                     product_id, amount_cents, currency)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, 'sgd'))
 		 ON CONFLICT (fb_comment_id) DO UPDATE SET updated_at = now()
 		 RETURNING id`,
 		pageID, c.CommentID, "pending_form",
 		nullIfEmpty(c.From.ID), nullIfEmpty(c.From.Name), nullIfEmpty(c.Message), nullIfEmpty(c.Post.PermalinkURL),
+		productID, amountCents, nullIfEmpty(prod.currency),
 	).Scan(&orderID)
 	if err != nil {
 		log.Error("create order failed", "step", "create_order", "err", err)
@@ -216,8 +278,14 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	log.Info("order created")
 
 	client := h.NewMessenger(pageAccessToken)
-	psid, err := client.SendPrivateReply(c.CommentID,
-		"Hey! Thanks for your interest 🙌 Tap below to pick your product and place your order.")
+	var psid string
+	if prod.productID != 0 {
+		psid, err = client.SendPrivateReplyButtons(c.CommentID,
+			orderReplyText(prod.keyword, prod.priceCents, prod.currency), paymentButtons(orderID))
+	} else {
+		psid, err = client.SendPrivateReply(c.CommentID,
+			"Hey! Thanks for your interest 🙌 We'll get back to you with the details shortly.")
+	}
 	if err != nil {
 		h.recordOrderError(ctx, log, orderID, "private_reply", err)
 		if messenger.IsPermanent(err) {
@@ -242,8 +310,7 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	}
 	log.Info("private reply sent", "permalink", c.Post.PermalinkURL)
 
-	// From here, a follow-up call (not shown) would send the product
-	// carousel to psid via client.SendProductCarousel(...).
+	// The customer's button tap arrives as a postback; see processPostback.
 	return false
 }
 
@@ -261,12 +328,32 @@ func nullIfEmpty(s string) *string {
 	return &s
 }
 
-func (h *Handler) lookupPage(ctx context.Context, fbPageID string) (pageID int64, accessToken string, err error) {
+type trigger struct {
+	pageID      int64
+	accessToken string
+	postWatched bool     // the post has at least one active trigger_posts row
+	keywords    []string // one per row; "" means use Handler.TriggerKeyword
+}
+
+// lookupTrigger loads the page and the post's active trigger rows. It returns
+// pgx.ErrNoRows only when the page itself is unknown.
+func (h *Handler) lookupTrigger(ctx context.Context, fbPageID, fbPostID string) (t trigger, err error) {
 	err = h.Pool.QueryRow(ctx,
-		`SELECT id, page_access_token FROM pages WHERE fb_page_id = $1`,
-		fbPageID,
-	).Scan(&pageID, &accessToken)
+		`SELECT p.id, p.page_access_token, count(tp.id) > 0,
+		        coalesce(array_agg(coalesce(tp.keyword, '') ORDER BY tp.keyword)
+		                 FILTER (WHERE tp.id IS NOT NULL), '{}')
+		 FROM pages p
+		 LEFT JOIN trigger_posts tp
+		        ON tp.page_id = p.id AND tp.fb_post_id = $2 AND tp.active
+		 WHERE p.fb_page_id = $1
+		 GROUP BY p.id, p.page_access_token`,
+		fbPageID, fbPostID,
+	).Scan(&t.pageID, &t.accessToken, &t.postWatched, &t.keywords)
 	return
+}
+
+func matchesKeyword(message, keyword string) bool {
+	return keyword != "" && strings.Contains(strings.ToLower(message), strings.ToLower(keyword))
 }
 
 func (h *Handler) validSignature(header string, body []byte) bool {
@@ -289,10 +376,26 @@ func (h *Handler) validSignature(header string, body []byte) bool {
 type webhookPayload struct {
 	Object string `json:"object"` // "page"
 	Entry  []struct {
-		ID      string        `json:"id"`   // Page ID
-		Time    int64         `json:"time"` // unix seconds
-		Changes []changeEntry `json:"changes"`
+		ID        string           `json:"id"`        // Page ID
+		Time      int64            `json:"time"`      // unix seconds
+		Changes   []changeEntry    `json:"changes"`   // feed: posts and comments
+		Messaging []messagingEvent `json:"messaging"` // Messenger: postbacks (button taps)
 	} `json:"entry"`
+}
+
+type messagingEvent struct {
+	Sender struct {
+		ID string `json:"id"` // customer's PSID
+	} `json:"sender"`
+	Recipient struct {
+		ID string `json:"id"` // Page ID
+	} `json:"recipient"`
+	Timestamp int64 `json:"timestamp"` // unix milliseconds
+	Postback  *struct {
+		MID     string `json:"mid"`
+		Title   string `json:"title"`
+		Payload string `json:"payload"`
+	} `json:"postback"`
 }
 
 type changeEntry struct {
@@ -300,6 +403,8 @@ type changeEntry struct {
 	Value commentValue `json:"value"`
 }
 
+// commentValue is a feed change's "value". Despite the name it is also used
+// for post changes, which share item/verb/post_id/message/from.
 type commentValue struct {
 	Item        string `json:"item"`
 	Verb        string `json:"verb"`
