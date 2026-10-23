@@ -101,6 +101,8 @@ func Middleware(next http.Handler) http.Handler {
 			switch {
 			case sw.status >= 500:
 				lvl = slog.LevelError
+			case sw.status == http.StatusTooManyRequests:
+				lvl = slog.LevelDebug // a flood; ratelimit logs a summary instead
 			case sw.status >= 400:
 				lvl = slog.LevelWarn
 			case r.URL.Path == "/health":

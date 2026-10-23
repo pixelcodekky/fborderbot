@@ -29,8 +29,8 @@ type Handler struct {
 	TriggerKeyword string // e.g. "order"
 	NewMessenger   func(pageAccessToken string) *messenger.Client
 
-	// Payments makes the payment links for the 2C2P and PayNow buttons; see
-	// payments.Service. Nil disables both buttons' links.
+	// Payments sets order quantities and makes the payment links for the
+	// 2C2P and Stripe Payment buttons; see payments.Service. Nil disables both.
 	Payments OrderPayments
 
 	Now func() time.Time // defaults to time.Now; overridden in tests
@@ -39,6 +39,7 @@ type Handler struct {
 // OrderPayments is implemented by *payments.Service.
 type OrderPayments interface {
 	Pay(ctx context.Context, method string, req payments.PayRequest) (payments.PayResult, error)
+	SetQuantity(ctx context.Context, orderID int64, qty int) (amountCents int64, res payments.PayResult, err error)
 }
 
 // privateReplyWindow is how long after a comment Meta still accepts a
@@ -137,10 +138,14 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, ev := range entry.Messaging {
-			if ev.Postback == nil {
-				continue // messages, reads, echoes: not handled
+			var failed bool
+			switch {
+			case ev.Postback != nil:
+				failed = h.processPostback(ctx, entry.ID, ev)
+			case ev.Message != nil:
+				failed = h.processMessage(ctx, entry.ID, ev)
 			}
-			if h.processPostback(ctx, entry.ID, ev) {
+			if failed {
 				retry = true
 			}
 		}
@@ -254,6 +259,7 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	// Create the order row immediately in pending_form status, keyed by the
 	// comment ID. On a retry the row already exists and we just get its id.
 	var orderID int64
+	// Quantity starts at 1; the customer picks it next (see setQuantity).
 	var productID, amountCents *int64
 	if prod.productID != 0 {
 		productID, amountCents = &prod.productID, &prod.priceCents
@@ -261,8 +267,8 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	err = h.Pool.QueryRow(ctx,
 		`INSERT INTO orders (page_id, fb_comment_id, status,
 		                     commenter_fb_id, commenter_name, comment_message, post_permalink,
-		                     product_id, amount_cents, currency)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, 'sgd'))
+		                     product_id, unit_price_cents, amount_cents, currency)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, coalesce($10, 'sgd'))
 		 ON CONFLICT (fb_comment_id) DO UPDATE SET updated_at = now()
 		 RETURNING id`,
 		pageID, c.CommentID, "pending_form",
@@ -281,7 +287,7 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	var psid string
 	if prod.productID != 0 {
 		psid, err = client.SendPrivateReplyButtons(c.CommentID,
-			orderReplyText(prod.keyword, prod.priceCents, prod.currency), paymentButtons(orderID))
+			quantityPromptText(prod.keyword, prod.priceCents, prod.currency), quantityButtons(orderID))
 	} else {
 		psid, err = client.SendPrivateReply(c.CommentID,
 			"Hey! Thanks for your interest 🙌 We'll get back to you with the details shortly.")
@@ -310,7 +316,8 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	}
 	log.Info("private reply sent", "permalink", c.Post.PermalinkURL)
 
-	// The customer's button tap arrives as a postback; see processPostback.
+	// The customer's quantity and payment taps arrive as postbacks; see
+	// processPostback.
 	return false
 }
 
@@ -379,7 +386,7 @@ type webhookPayload struct {
 		ID        string           `json:"id"`        // Page ID
 		Time      int64            `json:"time"`      // unix seconds
 		Changes   []changeEntry    `json:"changes"`   // feed: posts and comments
-		Messaging []messagingEvent `json:"messaging"` // Messenger: postbacks (button taps)
+		Messaging []messagingEvent `json:"messaging"` // Messenger: button taps and messages
 	} `json:"entry"`
 }
 
@@ -396,6 +403,14 @@ type messagingEvent struct {
 		Title   string `json:"title"`
 		Payload string `json:"payload"`
 	} `json:"postback"`
+	Message *struct {
+		MID        string `json:"mid"`
+		Text       string `json:"text"`
+		IsEcho     bool   `json:"is_echo"` // sent by the Page
+		QuickReply *struct {
+			Payload string `json:"payload"`
+		} `json:"quick_reply"`
+	} `json:"message"`
 }
 
 type changeEntry struct {

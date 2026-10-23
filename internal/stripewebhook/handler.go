@@ -3,7 +3,6 @@ package stripewebhook
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,7 +12,7 @@ import (
 	"github.com/stripe/stripe-go/v78/webhook"
 
 	"fb-order-bot/internal/db"
-	"fb-order-bot/internal/messenger"
+	"fb-order-bot/internal/notify"
 	"fb-order-bot/internal/obs"
 	"fb-order-bot/internal/payments"
 )
@@ -22,9 +21,7 @@ type Handler struct {
 	Pool          *pgxpool.Pool
 	WebhookSecret string
 	Payments      *payments.Service
-	NewMessenger  func(pageAccessToken string) *messenger.Client
-	// SendEmail delivers an order confirmation; wire up SES/SendGrid here.
-	SendEmail func(to, subject, body string) error
+	Notify        *notify.Customer
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,48 +112,11 @@ func (h *Handler) handleEvent(ctx context.Context, log *slog.Logger, event strip
 	// on the order rather than retried (a retry could double-send).
 	switch {
 	case applied.Outcome == payments.ApplyPaid:
-		h.confirm(ctx, log, applied)
+		h.Notify.Paid(ctx, log, applied)
 	case applied.Outcome == payments.ApplyFailed && event.Type == "checkout.session.async_payment_failed":
 		// An expired session needs no message: the customer just didn't pay.
-		h.send(ctx, log, applied, "payment_failed_message",
-			fmt.Sprintf("Your payment for order #%d didn't go through. Please tap \"PayNow\" again to retry.", applied.OrderID))
+		// Only PayNow is asynchronous; cards fail on the Checkout page.
+		h.Notify.Failed(ctx, log, applied, "Stripe Payment")
 	}
 	return nil
-}
-
-func (h *Handler) confirm(ctx context.Context, log *slog.Logger, ap payments.Applied) {
-	h.send(ctx, log, ap, "confirmation_message",
-		fmt.Sprintf("Payment received ✅ Order #%d for %s is confirmed. We'll be in touch about delivery!", ap.OrderID, ap.ProductName))
-
-	if h.SendEmail == nil {
-		return
-	}
-	var email *string
-	if err := h.Pool.QueryRow(ctx, `SELECT customer_email FROM orders WHERE id = $1`, ap.OrderID).Scan(&email); err != nil {
-		h.recordOrderError(ctx, log, ap.OrderID, "confirmation_email", fmt.Errorf("look up email: %w", err))
-		return
-	}
-	if email != nil && *email != "" {
-		body := fmt.Sprintf("Hi, thanks for your order! We've confirmed payment for: %s.", ap.ProductName)
-		if err := h.SendEmail(*email, "Order Confirmation", body); err != nil {
-			h.recordOrderError(ctx, log, ap.OrderID, "confirmation_email", err)
-		}
-	}
-}
-
-func (h *Handler) send(ctx context.Context, log *slog.Logger, ap payments.Applied, step, msg string) {
-	if ap.PSID == nil {
-		log.Warn("order has no psid; skipping Messenger message", "step", step)
-		return
-	}
-	if err := h.NewMessenger(ap.PageAccessToken).SendText(*ap.PSID, msg); err != nil {
-		h.recordOrderError(ctx, log, ap.OrderID, step, err)
-	}
-}
-
-func (h *Handler) recordOrderError(ctx context.Context, log *slog.Logger, orderID int64, step string, err error) {
-	log.Error(step+" failed", "step", step, "err", err)
-	if dbErr := db.RecordOrderError(ctx, h.Pool, orderID, step, err); dbErr != nil {
-		log.Error("record order error failed", "err", dbErr)
-	}
 }

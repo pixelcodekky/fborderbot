@@ -157,8 +157,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	var orderID int64
 	err = pool.QueryRow(ctx,
 		`WITH p AS (INSERT INTO pages (fb_page_id, name, page_access_token) VALUES ('1', 'Shop', 'tok') RETURNING id)
-		 INSERT INTO orders (page_id, fb_comment_id, psid, amount_cents, currency)
-		 SELECT id, 'c1', 'psid-1', 10000, 'sgd' FROM p RETURNING id`,
+		 INSERT INTO orders (page_id, fb_comment_id, psid, unit_price_cents, amount_cents, currency)
+		 SELECT id, 'c1', 'psid-1', 10000, 10000, 'sgd' FROM p RETURNING id`,
 	).Scan(&orderID)
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Receipt · Order #{{.OrderID}}</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1c1e21; --muted: #65676b; --line: #e4e6eb;
+    --ok: #1a7f37; --ok-bg: #dafbe1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #18191a; --card: #242526; --text: #e4e6eb; --muted: #b0b3b8; --line: #3a3b3c;
+      --ok: #4ac26b; --ok-bg: #12261a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; justify-content: center;
+    padding: 24px 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { width: 100%; max-width: 440px; background: var(--card); border-radius: 16px; padding: 28px 24px; align-self: flex-start; }
+  header { text-align: center; padding-bottom: 16px; border-bottom: 1px dashed var(--line); }
+  .shop { font-size: 20px; font-weight: 700; margin: 0; }
+  .paid { display: inline-block; margin-top: 10px; padding: 4px 12px; border-radius: 999px; background: var(--ok-bg); color: var(--ok); font-weight: 600; font-size: 14px; }
+  .total { font-size: 32px; font-weight: 700; margin: 12px 0 0; font-variant-numeric: tabular-nums; }
+  dl { margin: 16px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 10px 16px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  .items { border-bottom: 1px dashed var(--line); padding-bottom: 16px; }
+  footer { margin-top: 20px; color: var(--muted); font-size: 13px; text-align: center; }
+  @media print {
+    body { background: #fff; padding: 0; }
+    main { box-shadow: none; max-width: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="shop">{{.ShopName}}</p>
+    <span class="paid">✓ Paid</span>
+    <p class="total">{{.Total}}</p>
+  </header>
+  <dl class="items">
+    <dt>Order</dt><dd>#{{.OrderID}}</dd>
+    {{if .Item}}<dt>Item</dt><dd>{{.Item}}</dd>{{end}}
+    <dt>Quantity</dt><dd>{{.Quantity}}</dd>
+    {{if .UnitPrice}}<dt>Unit price</dt><dd>{{.UnitPrice}}</dd>{{end}}
+    <dt>Total</dt><dd><strong>{{.Total}}</strong></dd>
+  </dl>
+  <dl>
+    {{if .CustomerName}}<dt>Customer</dt><dd>{{.CustomerName}}</dd>{{end}}
+    <dt>Paid on</dt><dd>{{.PaidAt}}</dd>
+    <dt>Paid with</dt><dd>{{.PaidWith}}</dd>
+    {{if .Reference}}<dt>Reference</dt><dd>{{.Reference}}</dd>{{end}}
+    <dt>Invoice</dt><dd>{{.InvoiceNo}}</dd>
+  </dl>
+  <footer>Keep this page as proof of your order. Show it to us if you have any questions about your order.</footer>
+</main>
+</body>
+</html>

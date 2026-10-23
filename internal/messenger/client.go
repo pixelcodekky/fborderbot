@@ -115,6 +115,27 @@ func (c *Client) SendText(psid, text string) error {
 	return err
 }
 
+// QuickReply is a chip shown above the composer. Tapping it sends Title as a
+// message whose quick_reply.payload is Payload.
+type QuickReply struct {
+	Title   string // max 20 chars
+	Payload string
+}
+
+// SendQuickReplies sends text with up to 13 quick replies to a known PSID.
+func (c *Client) SendQuickReplies(psid, text string, replies []QuickReply) error {
+	qr := make([]map[string]string, len(replies))
+	for i, r := range replies {
+		qr[i] = map[string]string{"content_type": "text", "title": r.Title, "payload": r.Payload}
+	}
+	body := map[string]any{
+		"recipient": map[string]string{"id": psid},
+		"message":   map[string]any{"text": text, "quick_replies": qr},
+	}
+	_, err := c.post("/me/messages", body)
+	return err
+}
+
 // SendProductCarousel sends a Generic Template with a button that deep-links to
 // the order form webview for each product.
 func (c *Client) SendProductCarousel(psid string, products []CarouselItem) error {

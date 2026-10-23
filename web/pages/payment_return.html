@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>{{if eq .Status "paid"}}Payment received{{else if eq .Status "failed"}}Payment not completed{{else}}Payment{{end}}</title>
+<title>{{if eq .Status "paid"}}Payment received{{else if eq .Status "failed"}}Payment not completed{{else if eq .Status "cancelled"}}Payment cancelled{{else}}Payment{{end}}</title>
 <style>
   :root {
     --bg: #f5f6f8; --card: #ffffff; --text: #1c1e21; --muted: #65676b;
@@ -25,13 +25,14 @@
   main { width: 100%; max-width: 420px; background: var(--card); border-radius: 16px; padding: 32px 24px; text-align: center; }
   .icon { font-size: 48px; line-height: 1; margin-bottom: 12px; }
   h1 { font-size: 22px; margin: 0 0 8px; }
-  h1.paid { color: var(--ok); } h1.failed { color: var(--bad); } h1.pending { color: var(--wait); }
+  h1.paid { color: var(--ok); } h1.failed { color: var(--bad); } h1.pending, h1.cancelled { color: var(--wait); }
   p { margin: 8px 0; color: var(--muted); }
   .order { color: var(--text); font-weight: 600; }
   a.btn {
     display: inline-block; margin-top: 20px; padding: 12px 24px; border-radius: 999px;
     background: var(--btn); color: var(--btn-text); text-decoration: none; font-weight: 600;
   }
+  a.btn.secondary { background: transparent; color: var(--btn); border: 2px solid var(--btn); margin-right: 8px; }
 </style>
 </head>
 <body>
@@ -47,6 +48,12 @@
   {{if .OrderID}}<p class="order">Order #{{.OrderID}}{{if .Total}} · {{.Total}}{{end}}</p>{{end}}
   <p>Your payment didn't go through and you haven't been charged.</p>
   <p>Go back to Messenger and tap the payment button to try again.</p>
+{{else if eq .Status "cancelled"}}
+  <div class="icon" aria-hidden="true">↩️</div>
+  <h1 class="cancelled">Payment cancelled</h1>
+  {{if .OrderID}}<p class="order">Order #{{.OrderID}}{{if .Total}} · {{.Total}}{{end}}</p>{{end}}
+  <p>No payment was made and you haven't been charged.</p>
+  <p>Your order is still open. Go back to Messenger and tap a payment button whenever you're ready.</p>
 {{else if eq .Status "pending"}}
   <div class="icon" aria-hidden="true">⏳</div>
   <h1 class="pending">We're confirming your payment</h1>
@@ -57,6 +64,7 @@
   <h1>Thank you</h1>
   <p>You can close this page and return to Messenger. We'll message you there once your payment is confirmed.</p>
 {{end}}
+{{if .ReceiptURL}}<a class="btn secondary" href="{{.ReceiptURL}}">View receipt</a>{{end}}
 {{if .MessengerURL}}<a class="btn" href="{{.MessengerURL}}">Back to Messenger</a>{{end}}
 </main>
 </body>

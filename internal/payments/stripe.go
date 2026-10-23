@@ -18,12 +18,14 @@ type CheckoutSessions interface {
 
 // Stripe is Stripe Checkout as a Provider. A Checkout Session can be expired
 // on demand, so an expired attempt is closed for certain before a new page
-// is made.
+// is made, and a cancelled one is closed at once (it is a Canceler).
 type Stripe struct {
-	Sessions   CheckoutSessions
-	Methods    []string // payment method types, e.g. "paynow"; empty means card and PayNow
-	SuccessURL string
-	CancelURL  string
+	Sessions CheckoutSessions
+	Methods  []string // payment method types, e.g. "paynow"; empty means card and PayNow
+	// ReturnURL is the common payment return page; the customer comes back
+	// to it from Checkout with a ReturnLink signed with ReturnKey.
+	ReturnURL  string
+	ReturnKey  []byte
 	PageExpiry time.Duration // Stripe allows 30 minutes to 24 hours; defaults to 30 minutes
 }
 
@@ -54,8 +56,8 @@ func (p *Stripe) CreatePage(ctx context.Context, pg Page) (url, ref string, err 
 				},
 			},
 		},
-		SuccessURL: stripe.String(p.SuccessURL),
-		CancelURL:  stripe.String(p.CancelURL),
+		SuccessURL: stripe.String(ReturnLink(p.ReturnURL, p.ReturnKey, pg.InvoiceNo, ReturnDone)),
+		CancelURL:  stripe.String(ReturnLink(p.ReturnURL, p.ReturnKey, pg.InvoiceNo, ReturnCancel)),
 		// The webhook finds the attempt by this.
 		ClientReferenceID: stripe.String(pg.InvoiceNo),
 		// A minute past ours: Stripe needs at least 30 minutes from its own
@@ -80,6 +82,8 @@ func (p *Stripe) CreatePage(ctx context.Context, pg Page) (url, ref string, err 
 func (p *Stripe) Check(ctx context.Context, a Attempt) (Result, error) {
 	params := &stripe.CheckoutSessionParams{}
 	params.Context = ctx
+	// For which method the customer paid with (StripeResult).
+	params.AddExpand("payment_intent.payment_method")
 	sess, err := p.Sessions.Get(a.Ref, params)
 	if err != nil {
 		return Result{}, err
@@ -98,6 +102,13 @@ func (p *Stripe) Check(ctx context.Context, a Attempt) (Result, error) {
 	return r, nil
 }
 
+// Cancel expires the session the customer left, so another method can be
+// picked at once. A session that completed meanwhile reports its payment.
+func (p *Stripe) Cancel(ctx context.Context, a Attempt) (Result, error) {
+	a.Expired = true
+	return p.Check(ctx, a)
+}
+
 // StripeResult converts a Checkout Session. A completed session whose
 // payment is still processing (an async method) is ResultPending.
 func StripeResult(sess *stripe.CheckoutSession) Result {
@@ -110,7 +121,13 @@ func StripeResult(sess *stripe.CheckoutSession) Result {
 	if sess.PaymentIntent != nil {
 		r.TranRef = sess.PaymentIntent.ID
 	}
-	if len(sess.PaymentMethodTypes) > 0 {
+	// The method paid with, e.g. "card" or "paynow": known when the payment
+	// method is expanded, or when the session offered only one. Empty
+	// otherwise (a webhook's session carries the payment intent's id only).
+	switch {
+	case sess.PaymentIntent != nil && sess.PaymentIntent.PaymentMethod != nil && sess.PaymentIntent.PaymentMethod.Type != "":
+		r.ChannelCode = string(sess.PaymentIntent.PaymentMethod.Type)
+	case len(sess.PaymentMethodTypes) == 1:
 		r.ChannelCode = sess.PaymentMethodTypes[0]
 	}
 	switch {

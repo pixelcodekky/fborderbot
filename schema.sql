@@ -62,15 +62,17 @@ CREATE TABLE orders (
     comment_message             TEXT,                -- the comment that triggered the order
     post_permalink              TEXT,
     psid                        TEXT,                -- filled in once the user replies in Messenger
-    quantity                    INTEGER NOT NULL DEFAULT 1,
-    amount_cents                INTEGER,
+    quantity                    INTEGER NOT NULL DEFAULT 1,     -- chosen by the customer, 1-10
+    unit_price_cents            INTEGER,             -- product price when the order was made
+    amount_cents                INTEGER,             -- unit_price_cents x quantity; what payment pages charge
     currency                    TEXT NOT NULL DEFAULT 'sgd',
     customer_email              TEXT,
-    payment_method              TEXT,                -- 'card' | 'paynow' | '2c2p'
+    payment_method              TEXT,                -- '2c2p' | 'paynow' | 'stripe' (card)
     status                      TEXT NOT NULL DEFAULT 'pending_form',
         -- pending_form -> pending_payment -> paid -> fulfilled | payment_failed | cancelled
     stripe_checkout_session_id  TEXT,
     stripe_payment_intent_id    TEXT,
+    receipt_token               TEXT,                -- set when paid; the receipt is at /receipts/<token>
     last_error                  TEXT,                -- most recent failure, cleared on success
     last_error_step             TEXT,                -- e.g. 'private_reply', 'confirmation_email'
     last_error_at               TIMESTAMPTZ,
@@ -81,6 +83,7 @@ CREATE TABLE orders (
 CREATE INDEX idx_orders_page_status ON orders(page_id, status);
 CREATE UNIQUE INDEX idx_orders_comment ON orders(fb_comment_id);
 CREATE INDEX idx_orders_failed ON orders(last_error_at) WHERE last_error IS NOT NULL;
+CREATE UNIQUE INDEX idx_orders_receipt_token ON orders(receipt_token);
 
 -- One row per payment page (2C2P or PayNow) made for an order. An order has at
 -- most one pending attempt across methods, so it never has two pages that can
@@ -88,7 +91,7 @@ CREATE INDEX idx_orders_failed ON orders(last_error_at) WHERE last_error IS NOT 
 CREATE TABLE payment_attempts (
     id            BIGSERIAL PRIMARY KEY,
     order_id      BIGINT NOT NULL REFERENCES orders(id),
-    provider      TEXT NOT NULL DEFAULT '2c2p',  -- payment method: '2c2p' | 'paynow' (Stripe Checkout)
+    provider      TEXT NOT NULL DEFAULT '2c2p',  -- payment method: '2c2p' | 'paynow' | 'stripe' (both Stripe Checkout)
     invoice_no    TEXT NOT NULL UNIQUE,      -- our reference, e.g. FB42T1792459910123R9F3A (Stripe: client_reference_id)
     provider_ref  TEXT,                      -- the provider's id for the page (Stripe Checkout Session ID)
     amount_cents  INTEGER NOT NULL,          -- what this page charges; results are checked against it

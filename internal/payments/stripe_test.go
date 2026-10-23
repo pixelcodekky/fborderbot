@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -76,10 +77,10 @@ func (f *fakeSessions) status(id string) stripe.CheckoutSessionStatus {
 	return f.sessions[id].Status
 }
 
-// withStripe adds PayNow to the test env.
+// withStripe adds Stripe Checkout (card and PayNow) to the test env.
 func withStripe(e *testEnv) *fakeSessions {
 	f := &fakeSessions{sessions: map[string]*stripe.CheckoutSession{}}
-	e.s.Providers[MethodPayNow] = &Stripe{Sessions: f, Methods: []string{"paynow"}, SuccessURL: "https://shop/ok", CancelURL: "https://shop/cancel"}
+	e.s.Providers[MethodStripe] = &Stripe{Sessions: f, Methods: []string{"card", "paynow"}, ReturnURL: "https://bot/payments/return", ReturnKey: testReturnKey}
 	return f
 }
 
@@ -88,14 +89,16 @@ func (e *testEnv) payWith(t *testing.T, method string) (PayResult, error) {
 	return e.s.Pay(context.Background(), method, PayRequest{OrderID: e.orderID, AmountCents: 10000, Currency: "sgd", Description: "Order"})
 }
 
+var testReturnKey = []byte("return-key")
+
 func sessionID(url string) string { return url[len("https://checkout.example/"):] }
 
-func TestPayNowLinkBlocksOtherMethodUntilClosed(t *testing.T) {
+func TestStripeLinkBlocksOtherMethodUntilClosed(t *testing.T) {
 	e := newTestEnv(t)
 	f := withStripe(e)
-	first, err := e.payWith(t, MethodPayNow)
-	if err != nil || first.Outcome != PayNewLink || first.Method != MethodPayNow {
-		t.Fatalf("paynow: %+v %v", first, err)
+	first, err := e.payWith(t, MethodStripe)
+	if err != nil || first.Outcome != PayNewLink || first.Method != MethodStripe {
+		t.Fatalf("stripe: %+v %v", first, err)
 	}
 	p := f.params[0]
 	if *p.ClientReferenceID == "" || *p.ExpiresAt != e.now.Add(31*time.Minute).Unix() || p.IdempotencyKey == nil {
@@ -105,13 +108,13 @@ func TestPayNowLinkBlocksOtherMethodUntilClosed(t *testing.T) {
 		t.Errorf("expires at %v", first.ExpiresAt)
 	}
 
-	// PayNow again: the same session. 2C2P: told to use the PayNow link.
-	if again, _ := e.payWith(t, MethodPayNow); again.Outcome != PaySameLink || again.URL != first.URL {
-		t.Errorf("paynow again: %+v", again)
+	// Stripe again: the same session. 2C2P: told to use the Stripe link.
+	if again, _ := e.payWith(t, MethodStripe); again.Outcome != PaySameLink || again.URL != first.URL {
+		t.Errorf("stripe again: %+v", again)
 	}
 	other, err := e.payWith(t, Method2C2P)
-	if err != nil || other.Outcome != PaySameLink || other.Method != MethodPayNow {
-		t.Errorf("2c2p while paynow is live: %+v %v", other, err)
+	if err != nil || other.Outcome != PaySameLink || other.Method != MethodStripe {
+		t.Errorf("2c2p while stripe is live: %+v %v", other, err)
 	}
 	if len(f.params) != 1 || e.fake.tokens.Load() != 0 {
 		t.Errorf("%d sessions, %d 2c2p tokens; want 1 and 0", len(f.params), e.fake.tokens.Load())
@@ -129,23 +132,23 @@ func TestPayNowLinkBlocksOtherMethodUntilClosed(t *testing.T) {
 	}
 }
 
-func Test2C2PLinkBlocksPayNow(t *testing.T) {
+func Test2C2PLinkBlocksStripe(t *testing.T) {
 	e := newTestEnv(t)
 	f := withStripe(e)
 	e.payWith(t, Method2C2P)
-	res, err := e.payWith(t, MethodPayNow)
+	res, err := e.payWith(t, MethodStripe)
 	if err != nil || res.Outcome != PaySameLink || res.Method != Method2C2P {
-		t.Fatalf("paynow while 2c2p is live: %+v %v", res, err)
+		t.Fatalf("stripe while 2c2p is live: %+v %v", res, err)
 	}
 	if len(f.params) != 0 {
 		t.Errorf("%d stripe sessions created, want 0", len(f.params))
 	}
 }
 
-func TestExpiredPayNowFoundPaidIsNotReplaced(t *testing.T) {
+func TestExpiredStripeFoundPaidIsNotReplaced(t *testing.T) {
 	e := newTestEnv(t)
 	f := withStripe(e)
-	first, _ := e.payWith(t, MethodPayNow)
+	first, _ := e.payWith(t, MethodStripe)
 	f.complete(sessionID(first.URL)) // paid, but the webhook was lost
 	e.advance(31 * time.Minute)
 
@@ -157,7 +160,7 @@ func TestExpiredPayNowFoundPaidIsNotReplaced(t *testing.T) {
 	e.s.Pool.QueryRow(context.Background(),
 		`SELECT o.status, o.payment_method, a.tran_ref FROM orders o JOIN payment_attempts a ON a.order_id = o.id WHERE o.id = $1`,
 		e.orderID).Scan(&status, &method, &tranRef)
-	if status != "paid" || method != MethodPayNow || tranRef != "pi_"+sessionID(first.URL) {
+	if status != "paid" || method != MethodStripe || tranRef != "pi_"+sessionID(first.URL) {
 		t.Errorf("order %q via %q, tran_ref %q", status, method, tranRef)
 	}
 	if e.fake.tokens.Load() != 0 {
@@ -169,7 +172,7 @@ func TestStripeWebhookResults(t *testing.T) {
 	e := newTestEnv(t)
 	f := withStripe(e)
 	ctx := context.Background()
-	first, _ := e.payWith(t, MethodPayNow)
+	first, _ := e.payWith(t, MethodStripe)
 	id := sessionID(first.URL)
 
 	// Completed but still processing (async method): nothing applied.
@@ -194,7 +197,7 @@ func TestStripeWebhookResults(t *testing.T) {
 func TestStripeExpiredSessionAllowsNewLink(t *testing.T) {
 	e := newTestEnv(t)
 	f := withStripe(e)
-	first, _ := e.payWith(t, MethodPayNow)
+	first, _ := e.payWith(t, MethodStripe)
 	id := sessionID(first.URL)
 	exp, _ := f.Expire(id, nil)
 	if ap, _ := e.s.Apply(context.Background(), StripeResult(exp)); ap.Outcome != ApplyFailed {
@@ -203,15 +206,119 @@ func TestStripeExpiredSessionAllowsNewLink(t *testing.T) {
 	if s := e.orderStatus(t); s != "pending_payment" {
 		t.Errorf("order status %q, want pending_payment", s)
 	}
-	next, err := e.payWith(t, MethodPayNow)
+	next, err := e.payWith(t, MethodStripe)
 	if err != nil || next.Outcome != PayNewLink || next.URL == first.URL {
 		t.Fatalf("new link: %+v %v", next, err)
 	}
 }
 
+func TestStripeCheckoutOffersCardAndPayNow(t *testing.T) {
+	e := newTestEnv(t)
+	f := withStripe(e)
+	res, err := e.payWith(t, MethodStripe)
+	if err != nil || res.Outcome != PayNewLink || res.Method != MethodStripe {
+		t.Fatalf("stripe: %+v %v", res, err)
+	}
+	var types []string
+	for _, m := range f.params[0].PaymentMethodTypes {
+		types = append(types, *m)
+	}
+	if fmt.Sprint(types) != "[card paynow]" {
+		t.Errorf("payment method types %v, want [card paynow]", types)
+	}
+
+	if ap, err := e.s.Apply(context.Background(), StripeResult(f.complete(sessionID(res.URL)))); err != nil || ap.Outcome != ApplyPaid {
+		t.Fatalf("paid: %v %v", ap.Outcome, err)
+	}
+	var method string
+	e.s.Pool.QueryRow(context.Background(), `SELECT payment_method FROM orders WHERE id = $1`, e.orderID).Scan(&method)
+	if method != MethodStripe {
+		t.Errorf("payment_method %q, want %q", method, MethodStripe)
+	}
+}
+
+func TestStripeResultChannel(t *testing.T) {
+	both := []string{"card", "paynow"}
+	cases := []struct {
+		types []string
+		paid  stripe.PaymentMethodType
+		want  string
+	}{
+		{both, stripe.PaymentMethodType("paynow"), "paynow"}, // expanded, as Check fetches it
+		{both, "", ""},                     // a webhook's session: just the intent's id
+		{[]string{"paynow"}, "", "paynow"}, // an old PayNow-only session
+	}
+	for _, c := range cases {
+		sess := &stripe.CheckoutSession{PaymentMethodTypes: c.types, PaymentIntent: &stripe.PaymentIntent{ID: "pi_1"}}
+		if c.paid != "" {
+			sess.PaymentIntent.PaymentMethod = &stripe.PaymentMethod{Type: c.paid}
+		}
+		if got := StripeResult(sess).ChannelCode; got != c.want {
+			t.Errorf("%v paid %q: channel %q, want %q", c.types, c.paid, got, c.want)
+		}
+	}
+}
+
+func TestCheckoutReturnsToSignedLinks(t *testing.T) {
+	e := newTestEnv(t)
+	f := withStripe(e)
+	e.payWith(t, MethodStripe)
+	p := f.params[0]
+	for result, got := range map[string]string{ReturnDone: *p.SuccessURL, ReturnCancel: *p.CancelURL} {
+		u, err := url.Parse(got)
+		q := u.Query()
+		if err != nil || u.Path != "/payments/return" || q.Get("invoice") != *p.ClientReferenceID || q.Get("result") != result ||
+			!VerifyReturn(testReturnKey, q.Get("invoice"), result, q.Get("sig")) {
+			t.Errorf("%s url %s", result, got)
+		}
+	}
+}
+
+func TestCancelClosesCheckoutSoAnotherMethodCanBeUsed(t *testing.T) {
+	e := newTestEnv(t)
+	f := withStripe(e)
+	ctx := context.Background()
+	card, _ := e.payWith(t, MethodStripe)
+	inv := *f.params[0].ClientReferenceID
+
+	st, err := e.s.Cancel(ctx, inv)
+	if err != nil || st.Status != SettleCancelled || st.OrderID != e.orderID {
+		t.Fatalf("cancel: %+v %v", st, err)
+	}
+	if s := f.status(sessionID(card.URL)); s != stripe.CheckoutSessionStatusExpired {
+		t.Errorf("stripe session %q, want expired", s)
+	}
+	if s := e.orderStatus(t); s != "pending_payment" {
+		t.Errorf("order status %q, want pending_payment", s)
+	}
+	// Visiting the cancel link again changes nothing.
+	if again, _ := e.s.Cancel(ctx, inv); again.Status != SettleCancelled {
+		t.Errorf("second cancel: %v", again.Status)
+	}
+	// Straight away, not after the link's expiry: another method can be used.
+	next, err := e.payWith(t, Method2C2P)
+	if err != nil || next.Outcome != PayNewLink || next.Method != Method2C2P {
+		t.Fatalf("2c2p after cancel: %+v %v", next, err)
+	}
+}
+
+func TestCancelAfterPayingKeepsThePayment(t *testing.T) {
+	e := newTestEnv(t)
+	f := withStripe(e)
+	card, _ := e.payWith(t, MethodStripe)
+	f.complete(sessionID(card.URL)) // paid in another tab, then cancel tapped
+	st, err := e.s.Cancel(context.Background(), *f.params[0].ClientReferenceID)
+	if err != nil || st.Status != SettlePaid || st.Applied.Outcome != ApplyPaid {
+		t.Fatalf("got %+v %v", st, err)
+	}
+	if s := e.orderStatus(t); s != "paid" {
+		t.Errorf("order status %q", s)
+	}
+}
+
 func TestPayUnavailableMethod(t *testing.T) {
 	s := &Service{Providers: map[string]Provider{}}
-	if _, err := s.Pay(context.Background(), MethodPayNow, PayRequest{OrderID: 1}); !errors.Is(err, ErrMethodUnavailable) {
+	if _, err := s.Pay(context.Background(), MethodStripe, PayRequest{OrderID: 1}); !errors.Is(err, ErrMethodUnavailable) {
 		t.Errorf("got %v", err)
 	}
 }

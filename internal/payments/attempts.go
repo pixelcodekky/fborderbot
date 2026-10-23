@@ -21,7 +21,10 @@ import (
 // Payment methods: the customer's choice, and payment_attempts.provider.
 const (
 	Method2C2P   = "2c2p"
-	MethodPayNow = "paynow" // Stripe Checkout, PayNow only
+	MethodStripe = "stripe" // Stripe Checkout: card and PayNow
+	// MethodPayNow is the earlier PayNow-only Stripe Checkout. It is no
+	// longer offered, but its attempts are still settled and shown.
+	MethodPayNow = "paynow"
 )
 
 // Service takes payments for orders without letting one order be paid twice,
@@ -103,6 +106,10 @@ var ErrAlreadyPaid = errors.New("order already has a successful payment")
 
 // ErrMethodUnavailable means the payment method isn't configured.
 var ErrMethodUnavailable = errors.New("payment method is not configured")
+
+// ErrOrderChanged means the order's amount changed (e.g. its quantity) since
+// it was read; read it again.
+var ErrOrderChanged = errors.New("order amount changed")
 
 type PayOutcome int
 
@@ -239,11 +246,29 @@ func (s *Service) create(ctx context.Context, method string, req PayRequest) (Pa
 	expiresAt := now.Add(p.Expiry()).Truncate(time.Second)
 	invoiceNo := InvoiceNo(req.OrderID, now)
 
+	// The order row is locked while claiming, so a quantity change (see
+	// SetQuantity) can't slip in between reading the amount and the claim.
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return PayResult{}, err
+	}
+	defer tx.Rollback(ctx)
+	var orderAmount *int64
+	var orderCurrency string
+	if err := tx.QueryRow(ctx,
+		`SELECT amount_cents, currency FROM orders WHERE id = $1 FOR UPDATE`, req.OrderID,
+	).Scan(&orderAmount, &orderCurrency); err != nil {
+		return PayResult{}, fmt.Errorf("lock order: %w", err)
+	}
+	if orderAmount == nil || *orderAmount != req.AmountCents || !strings.EqualFold(orderCurrency, req.Currency) {
+		return PayResult{}, ErrOrderChanged
+	}
+
 	// Claim the order's one pending slot before calling the provider. A
 	// concurrent tap loses on the partial unique index. retry_of links the
 	// attempt to the order's last failed one, which can be retried only once.
 	var attemptID int64
-	err := s.Pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO payment_attempts (order_id, provider, invoice_no, amount_cents, currency, expires_at, retry_of)
 		 VALUES ($1, $2, $3, $4, $5, $6,
 		         (SELECT f.id FROM payment_attempts f
@@ -259,6 +284,9 @@ func (s *Service) create(ctx context.Context, method string, req PayRequest) (Pa
 		return PayResult{}, ErrPaymentInProgress
 	}
 	if err != nil {
+		return PayResult{}, fmt.Errorf("create payment attempt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return PayResult{}, fmt.Errorf("create payment attempt: %w", err)
 	}
 
@@ -318,6 +346,7 @@ type Applied struct {
 	PSID            *string
 	ProductName     string
 	PageAccessToken string
+	ReceiptToken    string // ApplyPaid: for ReceiptURL
 }
 
 // Apply records a final result (ResultPaid or ResultFailed) on its attempt
@@ -409,20 +438,25 @@ func (s *Service) Apply(ctx context.Context, r Result) (Applied, error) {
 		log.Error("payment arrived for an attempt marked failed", "step", "late_payment")
 	}
 
-	tag, err = tx.Exec(ctx,
+	// The receipt token makes the receipt link (see Receipt): random and
+	// unguessable, since the link is the only key to the receipt.
+	err = tx.QueryRow(ctx,
 		`UPDATE orders
 		 SET status = 'paid', payment_method = $1,
+		     receipt_token = COALESCE(receipt_token, replace(gen_random_uuid()::text, '-', '')),
 		     last_error = NULL, last_error_step = NULL, last_error_at = NULL, updated_at = now()
-		 WHERE id = $2 AND status <> 'paid'`,
+		 WHERE id = $2 AND status <> 'paid'
+		 RETURNING receipt_token`,
 		method, ap.OrderID,
-	)
-	if err != nil {
+	).Scan(&ap.ReceiptToken)
+	alreadyPaid := errors.Is(err, pgx.ErrNoRows)
+	if err != nil && !alreadyPaid {
 		return ap, fmt.Errorf("mark order paid: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ap, err
 	}
-	if tag.RowsAffected() == 0 {
+	if alreadyPaid {
 		s.recordOrderError(ctx, log, ap.OrderID, "double_payment",
 			fmt.Errorf("%s invoice %s (ref %s) paid an order that was already paid; refund it", method, r.InvoiceNo, r.TranRef))
 		ap.Outcome = ApplyDoublePayment
@@ -440,16 +474,25 @@ const (
 	SettleNotPaid                            // the provider has no successful payment for the invoice
 	SettlePending                            // no final answer yet; the notification or a later tap settles it
 	SettleUnknownInvoice                     // not one of our invoices
+	SettleCancelled                          // Cancel closed the page unpaid
 )
 
 // Settled is what Settle found out.
 type Settled struct {
-	Status      SettleStatus
-	OrderID     int64
-	PageFBID    string // for a link back to the Page in Messenger
-	AmountCents int64
-	Currency    string
-	Applied     Applied // set when this call recorded a payment (Applied.Outcome == ApplyPaid)
+	Status       SettleStatus
+	OrderID      int64
+	PageFBID     string // for a link back to the Page in Messenger
+	AmountCents  int64
+	Currency     string
+	ReceiptToken string  // SettlePaid: for ReceiptURL
+	Applied      Applied // set when this call recorded a payment (Applied.Outcome == ApplyPaid)
+}
+
+// Canceler is a Provider that can close a live page on demand.
+type Canceler interface {
+	// Cancel closes the attempt's page and reports its result, as Check does
+	// for an expired attempt.
+	Cancel(ctx context.Context, a Attempt) (Result, error)
 }
 
 // Settle checks an invoice's result when the customer's browser comes back
@@ -458,17 +501,30 @@ type Settled struct {
 // the customer may still pay on it, so a failure leaves the attempt pending
 // (the notification or a tap after expiry closes it).
 func (s *Service) Settle(ctx context.Context, invoiceNo string) (Settled, error) {
+	return s.settle(ctx, invoiceNo, false)
+}
+
+// Cancel is Settle for a customer who left the payment page without paying.
+// If the provider is a Canceler the page is closed and the attempt failed,
+// so the customer can pick a method again straight away (SettleCancelled);
+// otherwise it is just Settle. The caller must have checked that the
+// customer's return link is genuine (VerifyReturn).
+func (s *Service) Cancel(ctx context.Context, invoiceNo string) (Settled, error) {
+	return s.settle(ctx, invoiceNo, true)
+}
+
+func (s *Service) settle(ctx context.Context, invoiceNo string, cancel bool) (Settled, error) {
 	var st Settled
 	var status, method string
 	var ref *string
 	err := s.Pool.QueryRow(ctx,
-		`SELECT a.status, a.provider, a.provider_ref, a.amount_cents, a.currency, o.id, p.fb_page_id
+		`SELECT a.status, a.provider, a.provider_ref, a.amount_cents, a.currency, o.id, p.fb_page_id, COALESCE(o.receipt_token, '')
 		 FROM payment_attempts a
 		 JOIN orders o ON o.id = a.order_id
 		 JOIN pages p ON p.id = o.page_id
 		 WHERE a.invoice_no = $1`,
 		invoiceNo,
-	).Scan(&status, &method, &ref, &st.AmountCents, &st.Currency, &st.OrderID, &st.PageFBID)
+	).Scan(&status, &method, &ref, &st.AmountCents, &st.Currency, &st.OrderID, &st.PageFBID, &st.ReceiptToken)
 	if errors.Is(err, pgx.ErrNoRows) {
 		st.Status = SettleUnknownInvoice
 		return st, nil
@@ -476,8 +532,16 @@ func (s *Service) Settle(ctx context.Context, invoiceNo string) (Settled, error)
 	if err != nil {
 		return st, fmt.Errorf("look up payment attempt: %w", err)
 	}
-	if status == "succeeded" {
+	switch status {
+	case "succeeded":
 		st.Status = SettlePaid
+		return st, nil
+	case "pending":
+	default: // already closed unpaid, e.g. a second visit to the cancel link
+		st.Status = SettleNotPaid
+		if cancel {
+			st.Status = SettleCancelled
+		}
 		return st, nil
 	}
 
@@ -491,29 +555,48 @@ func (s *Service) Settle(ctx context.Context, invoiceNo string) (Settled, error)
 	if ref != nil {
 		a.Ref = *ref
 	}
-	r, err := p.Check(ctx, a)
+	c, canCancel := p.(Canceler)
+	cancel = cancel && canCancel
+	var r Result
+	if cancel {
+		r, err = c.Cancel(ctx, a)
+	} else {
+		r, err = p.Check(ctx, a)
+	}
 	switch {
 	case err != nil:
-		log.Warn("payment check on return failed", "err", err)
+		log.Warn("payment check on return failed", "cancel", cancel, "err", err)
 		st.Status = SettlePending
 		return st, nil
 	case r.Status == ResultPending:
 		st.Status = SettlePending
 		return st, nil
-	case r.Status == ResultFailed:
+	case r.Status == ResultFailed && !cancel:
 		log.Info("payment check on return: not paid", "resp_code", r.RespCode, "resp_desc", r.RespDesc)
 		st.Status = SettleNotPaid
 		return st, nil
 	}
 
 	r.InvoiceNo = invoiceNo
+	if r.Status == ResultFailed {
+		r.RespDesc = "cancelled by the customer"
+	}
 	st.Applied, err = s.Apply(ctx, r)
 	if err != nil {
 		return st, err
 	}
 	switch st.Applied.Outcome {
-	case ApplyPaid, ApplyAlreadyFinal, ApplyDoublePayment:
+	case ApplyPaid:
+		st.Status, st.ReceiptToken = SettlePaid, st.Applied.ReceiptToken
+	case ApplyAlreadyFinal, ApplyDoublePayment:
+		if r.Status == ResultFailed {
+			// Closed meanwhile, perhaps paid: read back what it ended as.
+			return s.settle(ctx, invoiceNo, cancel)
+		}
 		st.Status = SettlePaid
+	case ApplyFailed:
+		log.Info("payment cancelled by the customer")
+		st.Status = SettleCancelled
 	default: // a mismatch needs a person
 		st.Status = SettlePending
 	}
