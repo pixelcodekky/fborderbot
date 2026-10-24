@@ -52,8 +52,8 @@ func (h *Handler) lookupProduct(ctx context.Context, pageID int64, matched []str
 //	Order: test sales
 //	Price: SGD 100 each
 //	How many would you like?
-func quantityPromptText(keyword string, priceCents int64, currency string) string {
-	return fmt.Sprintf("Order: %s\nPrice: %s each\nHow many would you like?", keyword, formatMoney(priceCents, currency))
+func quantityPromptText(name string, priceCents int64, currency string) string {
+	return fmt.Sprintf("Order: %s\nPrice: %s each\nHow many would you like?", name, formatMoney(priceCents, currency))
 }
 
 // orderReplyText is the text above the payment buttons, once the quantity is

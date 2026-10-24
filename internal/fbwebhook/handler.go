@@ -287,7 +287,7 @@ func (h *Handler) processComment(ctx context.Context, pageFBID string, c comment
 	var psid string
 	if prod.productID != 0 {
 		psid, err = client.SendPrivateReplyButtons(c.CommentID,
-			quantityPromptText(prod.keyword, prod.priceCents, prod.currency), quantityButtons(orderID))
+			quantityPromptText(prod.name, prod.priceCents, prod.currency), quantityButtons(orderID))
 	} else {
 		psid, err = client.SendPrivateReply(c.CommentID,
 			"Hey! Thanks for your interest 🙌 We'll get back to you with the details shortly.")
